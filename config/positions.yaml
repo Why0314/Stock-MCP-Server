@@ -1,0 +1,27 @@
+positions:
+  - code: "002594"
+    name: "比亚迪"
+    cost: 99.46
+    shares: 200
+  - code: "513120"
+    name: "港股创新药ETF"
+    cost: 1.305
+  - code: "513350"
+    name: "标普油气ETF富国"
+    cost: 1.283
+  - code: "600219"
+    name: "南山铝业"
+    cost: 5.777
+  - code: "600965"
+    name: "*ST福成"
+    cost: 3.10
+  - code: "601868"
+    name: "中国能建"
+    cost: 2.90
+  - code: "002224"
+    name: "三力士"
+    cost: 4.65
+  - code: "002638"
+    name: "勤上股份"
+    cost: 4.711
+

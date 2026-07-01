@@ -1,0 +1,4 @@
+[mcp_servers.stock_mcp]
+command = "/absolute/path/to/Stock-MCP-Server/.venv/bin/python"
+args = ["-m", "stock_mcp.server"]
+env = { PYTHONPATH = "/absolute/path/to/Stock-MCP-Server/src" }

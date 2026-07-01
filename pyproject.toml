@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-mcp-server"
+version = "0.1.0"
+description = "Stock MCP server with configurable local history and finance CSV data paths."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "akshare>=1.14.0",
+  "pandas>=2.0.0",
+  "numpy>=1.24.0",
+  "mcp[cli]>=1.27,<2",
+  "pyyaml>=6.0.0",
+]
+
+[project.scripts]
+stock-mcp-server = "stock_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+package = true
