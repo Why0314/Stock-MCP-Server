@@ -152,6 +152,52 @@ def test_build_quote_from_eastmoney_payload_maps_fields() -> None:
     assert result.data_source == "eastmoney.stock.get"
 
 
+def test_build_kline_frame_from_eastmoney_maps_payload() -> None:
+    provider = AKShareProvider()
+
+    frame = provider._build_kline_frame_from_eastmoney(
+        {
+            "data": {
+                "klines": [
+                    "2026-07-09,27.95,28.04,28.35,27.93,124837,351541767.78,1.5,1.04,0.29,0.17"
+                ]
+            }
+        },
+        symbol="000338",
+    )
+
+    assert frame.iloc[0]["股票代码"] == "000338"
+    assert frame.iloc[0]["开盘"] == 27.95
+    assert frame.iloc[0]["收盘"] == 28.04
+    assert frame.iloc[0]["最高"] == 28.35
+
+
+def test_get_kline_prefers_direct_a_share_history(monkeypatch) -> None:
+    provider = AKShareProvider()
+    frame = provider._build_kline_frame_from_eastmoney(
+        {
+            "data": {
+                "klines": [
+                    "2026-07-09,27.95,28.04,28.35,27.93,124837,351541767.78,1.5,1.04,0.29,0.17"
+                ]
+            }
+        },
+        symbol="000338",
+    )
+
+    monkeypatch.setattr(provider, "_get_a_share_hist_direct", lambda symbol, start_date, end_date, adjust: frame)
+    monkeypatch.setattr(
+        "stock_mcp.providers.akshare_provider.ak.stock_zh_a_hist",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy akshare A-share path should not be used")),
+    )
+
+    result = provider.get_kline(code="000338", start_date="20260101", end_date="20260709", adjust="qfq")
+
+    assert result[0].code == "000338"
+    assert result[0].data_source == "eastmoney.stock.kline"
+    assert result[0].close_price == 28.04
+
+
 def test_get_quotes_uses_direct_path_and_delayed_etf_fallback(monkeypatch) -> None:
     provider = AKShareProvider()
 

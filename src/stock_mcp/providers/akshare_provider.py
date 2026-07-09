@@ -23,7 +23,10 @@ class ProviderFailure(Exception):
 
 class AKShareProvider:
     _EASTMONEY_QUOTE_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
+    _EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
     _EASTMONEY_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170"
+    _EASTMONEY_KLINE_FIELDS1 = "f1,f2,f3,f4,f5,f6"
+    _EASTMONEY_KLINE_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116"
     _EASTMONEY_UT = "fa5fd1943c7b386f172d6893dbfba10b"
 
     def get_quotes(self, codes: list[str], as_of: str) -> list[Quote]:
@@ -77,8 +80,8 @@ class AKShareProvider:
                     source = "akshare.fund_etf_hist_sina"
                     frame = self._filter_sina_etf_hist(frame=frame, start_date=start_date, end_date=end_date)
             else:
-                frame = ak.stock_zh_a_hist(symbol=digits, period="daily", start_date=start_date, end_date=end_date, adjust=adjust)
-                source = "akshare.stock_zh_a_hist"
+                frame = self._get_a_share_hist_direct(symbol=digits, start_date=start_date, end_date=end_date, adjust=adjust)
+                source = "eastmoney.stock.kline"
         except Exception as exc:  # pragma: no cover - network/runtime path
             raise ProviderFailure(f"akshare.{market.lower()}_hist", str(exc)) from exc
 
@@ -92,6 +95,67 @@ class AKShareProvider:
             return ak.stock_zh_a_spot_em(), "akshare.stock_zh_a_spot_em"
         except Exception:
             return ak.stock_zh_a_spot(), "akshare.stock_zh_a_spot"
+
+    def _get_a_share_hist_direct(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+    ) -> pd.DataFrame:
+        adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
+        params = {
+            "fields1": self._EASTMONEY_KLINE_FIELDS1,
+            "fields2": self._EASTMONEY_KLINE_FIELDS2,
+            "ut": self._EASTMONEY_UT,
+            "klt": "101",
+            "fqt": adjust_dict.get(adjust, "0"),
+            "secid": self._secid_for_symbol(symbol),
+            "beg": start_date,
+            "end": end_date,
+        }
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                with requests.Session() as session:
+                    response = session.get(
+                        self._EASTMONEY_KLINE_URL,
+                        params=params,
+                        timeout=(3, 8),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                return self._build_kline_frame_from_eastmoney(payload=payload, symbol=symbol)
+            except Exception as exc:  # pragma: no cover - network/runtime path
+                last_error = exc
+        raise last_error or ValueError("failed to fetch eastmoney kline")
+
+    def _build_kline_frame_from_eastmoney(self, payload: dict, symbol: str) -> pd.DataFrame:
+        data = payload.get("data") or {}
+        klines = data.get("klines") or []
+        if not klines:
+            return pd.DataFrame()
+        frame = pd.DataFrame([item.split(",") for item in klines])
+        frame["股票代码"] = symbol
+        frame.columns = [
+            "日期",
+            "开盘",
+            "收盘",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "振幅",
+            "涨跌幅",
+            "涨跌额",
+            "换手率",
+            "股票代码",
+        ]
+        for column in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
+        return frame[["日期", "股票代码", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]]
 
     def _get_realtime_quotes_direct(self, normalized_codes: list[str], as_of: str) -> tuple[list[Quote], list[str]]:
         if not normalized_codes:
