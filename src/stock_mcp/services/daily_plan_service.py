@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from stock_mcp.config_loader import load_named_records
 from stock_mcp.services.quote_service import QuoteService
 from stock_mcp.services.wyckoff_service import WyckoffService
@@ -30,9 +32,10 @@ class DailyPlanService:
         quotes = self._quote_service.get_quotes(codes)
         quote_map = {item["code"]: item for item in quotes.get("items", [])}
         items: list[dict] = []
+        analyses = self._analyze_codes(codes)
 
         for code, record in deduped.items():
-            analysis = self._wyckoff_service.analyze(code=code)
+            analysis = analyses.get(code, {"code": code, "error": {"message": "analysis unavailable", "source": "daily_plan_service"}})
             if analysis.get("error"):
                 items.append(
                     {
@@ -67,6 +70,22 @@ class DailyPlanService:
             "data_status": "ok" if items else "empty",
             "items": items,
         }
+
+    def _analyze_codes(self, codes: list[str]) -> dict[str, dict]:
+        if not codes:
+            return {}
+
+        results: dict[str, dict] = {}
+        max_workers = min(6, len(codes)) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(self._wyckoff_service.analyze, code=code): code for code in codes}
+            for future in as_completed(future_map):
+                code = future_map[future]
+                try:
+                    results[code] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive runtime path
+                    results[code] = {"code": code, "error": {"message": str(exc), "source": "daily_plan_service"}}
+        return results
 
 
 def _plan_action_from_stage(stage: str) -> tuple[str, str]:
