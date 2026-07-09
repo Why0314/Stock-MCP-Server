@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import re
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from stock_mcp.models import KlineBar, Quote
 from stock_mcp.utils.symbol import infer_market, normalize_symbol, to_digits
@@ -20,48 +22,42 @@ class ProviderFailure(Exception):
 
 
 class AKShareProvider:
+    _EASTMONEY_QUOTE_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
+    _EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    _EASTMONEY_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170"
+    _EASTMONEY_KLINE_FIELDS1 = "f1,f2,f3,f4,f5,f6"
+    _EASTMONEY_KLINE_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116"
+    _EASTMONEY_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+
     def get_quotes(self, codes: list[str], as_of: str) -> list[Quote]:
-        a_codes = [normalize_symbol(code) for code in codes if infer_market(code) in {"A", "BJ"}]
-        etf_codes = [to_digits(code) for code in codes if infer_market(code) == "ETF"]
-        results: list[Quote] = []
+        normalized_codes = [normalize_symbol(code) for code in codes]
+        direct_results, direct_failures = self._get_realtime_quotes_direct(normalized_codes=normalized_codes, as_of=as_of)
+        results = {item.code: item for item in direct_results}
 
-        if a_codes:
+        missing_etf_codes = [
+            to_digits(code)
+            for code in normalized_codes
+            if infer_market(code) == "ETF" and to_digits(code) not in results
+        ]
+        if missing_etf_codes:
             try:
-                a_frame = ak.stock_zh_a_spot()
-                results.extend(self._select_quotes(a_frame, a_codes, market="A", as_of=as_of, source="akshare.stock_zh_a_spot"))
-            except Exception as exc:  # pragma: no cover - network/runtime path
-                raise ProviderFailure("akshare.stock_zh_a_spot", str(exc)) from exc
-
-        if etf_codes:
-            try:
-                etf_frame = ak.fund_etf_spot_em()
-                results.extend(
-                    self._select_quotes(
-                        etf_frame,
-                        etf_codes,
-                        market="ETF",
-                        as_of=as_of,
-                        source="akshare.fund_etf_spot_em",
-                    )
+                delayed_frame = ak.fund_etf_fund_daily_em()
+                delayed_results = self._select_etf_daily_quotes(
+                    frame=delayed_frame,
+                    codes=missing_etf_codes,
+                    as_of=as_of,
+                    source="akshare.fund_etf_fund_daily_em(delayed)",
                 )
-            except Exception as exc:  # pragma: no cover - network/runtime path
-                try:
-                    delayed_frame = ak.fund_etf_fund_daily_em()
-                    results.extend(
-                        self._select_etf_daily_quotes(
-                            frame=delayed_frame,
-                            codes=etf_codes,
-                            as_of=as_of,
-                            source="akshare.fund_etf_fund_daily_em(delayed)",
-                        )
-                    )
-                except Exception as delayed_exc:  # pragma: no cover - network/runtime path
-                    raise ProviderFailure(
-                        "akshare.fund_etf_spot_em",
-                        f"{exc}; delayed fallback failed: {delayed_exc}",
-                    ) from delayed_exc
+                for item in delayed_results:
+                    results[item.code] = item
+            except Exception:
+                pass
 
-        return sorted(results, key=lambda item: item.code)
+        if results:
+            return sorted(results.values(), key=lambda item: item.code)
+
+        message = "; ".join(direct_failures) if direct_failures else "no quote data returned"
+        raise ProviderFailure("eastmoney.stock.get", message)
 
     def get_kline(
         self,
@@ -84,8 +80,8 @@ class AKShareProvider:
                     source = "akshare.fund_etf_hist_sina"
                     frame = self._filter_sina_etf_hist(frame=frame, start_date=start_date, end_date=end_date)
             else:
-                frame = ak.stock_zh_a_hist(symbol=digits, period="daily", start_date=start_date, end_date=end_date, adjust=adjust)
-                source = "akshare.stock_zh_a_hist"
+                frame = self._get_a_share_hist_direct(symbol=digits, start_date=start_date, end_date=end_date, adjust=adjust)
+                source = "eastmoney.stock.kline"
         except Exception as exc:  # pragma: no cover - network/runtime path
             raise ProviderFailure(f"akshare.{market.lower()}_hist", str(exc)) from exc
 
@@ -93,6 +89,143 @@ class AKShareProvider:
             return []
 
         return self._build_kline_items(frame=frame, code=digits, name=name, source=source)
+
+    def _get_a_share_spot_frame(self) -> tuple[pd.DataFrame, str]:
+        try:
+            return ak.stock_zh_a_spot_em(), "akshare.stock_zh_a_spot_em"
+        except Exception:
+            return ak.stock_zh_a_spot(), "akshare.stock_zh_a_spot"
+
+    def _get_a_share_hist_direct(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+    ) -> pd.DataFrame:
+        adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
+        params = {
+            "fields1": self._EASTMONEY_KLINE_FIELDS1,
+            "fields2": self._EASTMONEY_KLINE_FIELDS2,
+            "ut": self._EASTMONEY_UT,
+            "klt": "101",
+            "fqt": adjust_dict.get(adjust, "0"),
+            "secid": self._secid_for_symbol(symbol),
+            "beg": start_date,
+            "end": end_date,
+        }
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                with requests.Session() as session:
+                    response = session.get(
+                        self._EASTMONEY_KLINE_URL,
+                        params=params,
+                        timeout=(3, 8),
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                return self._build_kline_frame_from_eastmoney(payload=payload, symbol=symbol)
+            except Exception as exc:  # pragma: no cover - network/runtime path
+                last_error = exc
+        raise last_error or ValueError("failed to fetch eastmoney kline")
+
+    def _build_kline_frame_from_eastmoney(self, payload: dict, symbol: str) -> pd.DataFrame:
+        data = payload.get("data") or {}
+        klines = data.get("klines") or []
+        if not klines:
+            return pd.DataFrame()
+        frame = pd.DataFrame([item.split(",") for item in klines])
+        frame["股票代码"] = symbol
+        frame.columns = [
+            "日期",
+            "开盘",
+            "收盘",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "振幅",
+            "涨跌幅",
+            "涨跌额",
+            "换手率",
+            "股票代码",
+        ]
+        for column in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
+        return frame[["日期", "股票代码", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]]
+
+    def _get_realtime_quotes_direct(self, normalized_codes: list[str], as_of: str) -> tuple[list[Quote], list[str]]:
+        if not normalized_codes:
+            return [], []
+
+        results: list[Quote] = []
+        failures: list[str] = []
+        max_workers = min(8, len(normalized_codes)) or 1
+        with requests.Session() as session:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(self._fetch_single_quote, session, code, as_of): code for code in normalized_codes
+                }
+                for future in as_completed(future_map):
+                    code = future_map[future]
+                    try:
+                        quote = future.result()
+                    except Exception as exc:  # pragma: no cover - network/runtime path
+                        failures.append(f"{to_digits(code)}: {exc}")
+                        continue
+                    if quote is not None:
+                        results.append(quote)
+                    else:
+                        failures.append(f"{to_digits(code)}: empty data")
+        return results, failures
+
+    def _fetch_single_quote(self, session: requests.Session, code: str, as_of: str) -> Quote | None:
+        response = session.get(
+            self._EASTMONEY_QUOTE_URL,
+            params={
+                "secid": self._secid_for_symbol(code),
+                "invt": "2",
+                "fltt": "2",
+                "fields": self._EASTMONEY_FIELDS,
+                "ut": self._EASTMONEY_UT,
+            },
+            timeout=(3, 5),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("rc") != 0 or not payload.get("data"):
+            raise ValueError(payload.get("data") or payload.get("rc") or "unexpected response")
+        return self._build_quote_from_eastmoney_payload(payload["data"], code=code, as_of=as_of)
+
+    def _build_quote_from_eastmoney_payload(self, data: dict, code: str, as_of: str) -> Quote:
+        market = infer_market(code)
+        return Quote(
+            code=to_digits(code),
+            name=str(data.get("f58") or ""),
+            market=market,
+            price=_optional_float(data.get("f43")),
+            change_pct=_optional_float(data.get("f170")),
+            volume=_optional_float(data.get("f47")),
+            amount=_optional_float(data.get("f48")),
+            turnover_rate=_optional_float(data.get("f168")),
+            open_price=_optional_float(data.get("f46")),
+            high_price=_optional_float(data.get("f44")),
+            low_price=_optional_float(data.get("f45")),
+            previous_close=_optional_float(data.get("f60")),
+            data_source="eastmoney.stock.get",
+            as_of=as_of,
+        )
+
+    def _secid_for_symbol(self, symbol: str) -> str:
+        normalized = normalize_symbol(symbol)
+        digits = to_digits(normalized)
+        if normalized.startswith("sh"):
+            return f"1.{digits}"
+        return f"0.{digits}"
 
     def _select_quotes(
         self,
@@ -102,7 +235,9 @@ class AKShareProvider:
         as_of: str,
         source: str,
     ) -> list[Quote]:
-        selected = frame[frame["代码"].astype(str).isin(codes)].copy()
+        canonical_codes = {normalize_symbol(code) for code in codes}
+        matched_codes = frame["代码"].astype(str).map(self._canonicalize_quote_code)
+        selected = frame[matched_codes.isin(canonical_codes)].copy()
         return [
             Quote(
                 code=to_digits(str(row["代码"])),
@@ -188,6 +323,12 @@ class AKShareProvider:
         if pd.notna(end):
             result = result[result["date"] <= end]
         return result.reset_index(drop=True)
+
+    def _canonicalize_quote_code(self, code: str) -> str:
+        digits = "".join(ch for ch in str(code) if ch.isdigit())
+        if len(digits) == 6:
+            return normalize_symbol(digits)
+        return str(code).strip().lower()
 
 
 def _optional_float(value: object) -> float | None:
